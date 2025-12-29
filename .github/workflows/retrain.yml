@@ -1,0 +1,39 @@
+name: Retrain MLOps Model
+
+on:
+  workflow_dispatch: # manual trigger
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Seed synthetic data
+        run: |
+          source venv/bin/activate
+          python -m scripts.seed_data
+
+      - name: Retrain model
+        run: |
+          source venv/bin/activate
+          python -m scripts.train
+
+      - name: Test inference
+        run: |
+          source venv/bin/activate
+          python -m scripts.inference
