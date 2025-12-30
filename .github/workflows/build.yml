@@ -52,6 +52,7 @@ jobs:
           source venv/bin/activate
           python scripts/seed_data.py
         env:
+          PYTHONPATH: ${{ github.workspace }}
           POSTGRES_USER: myuser
           POSTGRES_PASSWORD: mypassword
           POSTGRES_DB: mydb
