@@ -15,9 +15,9 @@ jobs:
       postgres:
         image: postgres:15
         env:
-          POSTGRES_USER: myuser
-          POSTGRES_PASSWORD: mypassword
-          POSTGRES_DB: mydb
+          POSTGRES_USER: demo
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: demo
         ports:
           - 5432:5432
         options: >-
@@ -54,9 +54,9 @@ jobs:
           source venv/bin/activate
           python scripts/seed_data.py
         env:
-          POSTGRES_USER: myuser
-          POSTGRES_PASSWORD: mypassword
-          POSTGRES_DB: mydb
+          POSTGRES_USER: demo
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: demo
           POSTGRES_HOST: localhost
           POSTGRES_PORT: 5432
           PYTHONPATH: ${{ github.workspace }}
