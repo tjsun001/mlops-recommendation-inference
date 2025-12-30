@@ -83,3 +83,23 @@ jobs:
           if-no-files-found: warn
           compression-level: 6
           overwrite: false
+      - name: Verify trained model artifact
+        run: |
+          echo "Listing models directory:"
+          find models -maxdepth 4 -type f -print -exec ls -lh {} \;
+
+          python - <<'PY'
+          import os, pickle, glob
+          candidates = glob.glob("models/**/model.pkl", recursive=True)
+          assert candidates, "No model.pkl found under models/**/model.pkl"
+
+          # pick the largest one (guards against empty placeholders)
+          path = max(candidates, key=lambda p: os.path.getsize(p))
+          size = os.path.getsize(path)
+          assert size > 0, f"Model file is empty: {path}"
+
+          with open(path, "rb") as f:
+            obj = pickle.load(f)
+
+          print(f"OK: loaded pickle from {path} ({size} bytes). Type={type(obj)}")
+          PY
