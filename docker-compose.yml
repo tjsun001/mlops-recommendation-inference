@@ -12,9 +12,8 @@ services:
 
   inference:
     container_name: inference
-    build:
-      context: ./api
-      dockerfile: Dockerfile
+    # CHANGED: pull from Docker Hub instead of building locally on EC2
+    image: tjsun001/mlops-recommendation-inference:latest
     environment:
       MODEL_PATH: /tmp/model.pkl
       AWS_REGION: us-east-1
@@ -28,26 +27,3 @@ services:
       interval: 15s
       timeout: 3s
       retries: 10
-      start_period: 20s
-    networks: [amigos]
-
-  product-service:
-    container_name: product
-    image: cicd-with-github-actions-product-service:latest
-    environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/jfs
-      SPRING_DATASOURCE_USERNAME: amigoscode
-      SPRING_DATASOURCE_PASSWORD: password
-      INFERENCE_BASE_URL: http://inference:8000
-    ports:
-      - "5050:5050"
-    depends_on:
-      db:
-        condition: service_started
-      inference:
-        condition: service_healthy
-    networks: [amigos]
-
-networks:
-  amigos:
-    driver: bridge
