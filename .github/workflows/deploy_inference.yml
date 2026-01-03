@@ -1,21 +1,19 @@
-name: Deploy Inference (EC2)
+name: Deploy Inference Model (EC2)
+
+permissions:
+  contents: read
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - "api/**"
-      - "api/requirements.txt"
-      - "api/Dockerfile"
-      - "docker-compose.yml"
-      - ".github/workflows/deploy_inference.yml"
+  schedule:
+    - cron: "30 13 * * 0"  # Sundays 8:30am ET (13:30 UTC)
 
 jobs:
-  deploy:
+  deploy-inference-model:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Deploy inference on EC2 (pull model from S3, pull image from Docker Hub)
+      - name: Pull model from S3 and restart inference on EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -24,27 +22,23 @@ jobs:
           script: |
             set -euo pipefail
 
-            # --- 1) Pull latest model from S3 to the host path that compose mounts ---
+            APP_DIR="/home/ubuntu/my-mlops-demo"
             S3_URI="s3://thurmans-demo-models/mlops/models/model.pkl"
-            MODEL_DIR="/home/ubuntu/my-mlops-demo/my-ml-ops-inference/models"
+
+            # Matches docker-compose mount: ./models/model.pkl:/tmp/model.pkl:ro
+            MODEL_DIR="${APP_DIR}/models"
             MODEL_TMP="${MODEL_DIR}/model.pkl.tmp"
             MODEL_DST="${MODEL_DIR}/model.pkl"
 
-            echo "[deploy-inference] Pulling model from S3 -> ${MODEL_DST}"
+            echo "[deploy-model] Pulling model from S3 -> ${MODEL_DST}"
             mkdir -p "${MODEL_DIR}"
             aws s3 cp "${S3_URI}" "${MODEL_TMP}"
             test -s "${MODEL_TMP}"
             mv -f "${MODEL_TMP}" "${MODEL_DST}"
             ls -lah "${MODEL_DST}"
 
-            # --- 2) Pull the latest inference image from Docker Hub and restart only inference ---
-            cd /home/ubuntu/my-mlops-demo
-
-            echo "[deploy-inference] Pulling inference image"
+            echo "[deploy-model] Pulling inference image + restarting inference only"
+            cd "${APP_DIR}"
             docker compose pull inference
-
-            echo "[deploy-inference] Recreating inference service"
-            docker compose up -d --no-deps inference
-
-            echo "[deploy-inference] Status"
+            docker compose up -d --no-deps --force-recreate inference
             docker compose ps inference
