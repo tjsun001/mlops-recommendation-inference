@@ -1,0 +1,50 @@
+name: Deploy Inference (EC2)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - "api/requirements.txt"
+      - "api/Dockerfile"
+      - "docker-compose.yml"
+      - ".github/workflows/deploy_inference.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy inference on EC2 (pull model from S3, pull image from Docker Hub)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+
+            # --- 1) Pull latest model from S3 to the host path that compose mounts ---
+            S3_URI="s3://thurmans-demo-models/mlops/models/model.pkl"
+            MODEL_DIR="/home/ubuntu/my-mlops-demo/my-ml-ops-inference/models"
+            MODEL_TMP="${MODEL_DIR}/model.pkl.tmp"
+            MODEL_DST="${MODEL_DIR}/model.pkl"
+
+            echo "[deploy-inference] Pulling model from S3 -> ${MODEL_DST}"
+            mkdir -p "${MODEL_DIR}"
+            aws s3 cp "${S3_URI}" "${MODEL_TMP}"
+            test -s "${MODEL_TMP}"
+            mv -f "${MODEL_TMP}" "${MODEL_DST}"
+            ls -lah "${MODEL_DST}"
+
+            # --- 2) Pull the latest inference image from Docker Hub and restart only inference ---
+            cd /home/ubuntu/my-mlops-demo
+
+            echo "[deploy-inference] Pulling inference image"
+            docker compose pull inference
+
+            echo "[deploy-inference] Recreating inference service"
+            docker compose up -d --no-deps inference
+
+            echo "[deploy-inference] Status"
+            docker compose ps inference
