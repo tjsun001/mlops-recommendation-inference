@@ -1,0 +1,38 @@
+name: Deploy Inference Model (EC2)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 13 * * 0"  # Sundays 8:15am ET (13:15 UTC) - adjust if you want
+
+jobs:
+  deploy-model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull model from S3 and restart inference on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+
+            APP_DIR="/home/ubuntu/my-mlops-demo"
+            S3_URI="s3://thurmans-demo-models/mlops/models/model.pkl"
+
+            MODEL_DIR="${APP_DIR}/models"
+            TMP="${MODEL_DIR}/model.pkl.tmp"
+            DST="${MODEL_DIR}/model.pkl"
+
+            echo "[deploy-model] Pulling model from S3 -> ${DST}"
+            mkdir -p "${MODEL_DIR}"
+            aws s3 cp "${S3_URI}" "${TMP}"
+            test -s "${TMP}"
+            mv -f "${TMP}" "${DST}"
+            ls -lah "${DST}"
+
+            echo "[deploy-model] Restarting inference only"
+            cd "${APP_DIR}"
+            docker compose up -d --no-deps --force-recreate inference
+            docker compose ps inference
