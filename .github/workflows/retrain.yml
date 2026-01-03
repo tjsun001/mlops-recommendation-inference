@@ -1,27 +1,45 @@
 name: MLops Weekly Retrain
+
 permissions:
   id-token: write
   contents: read
 
-
 on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+  # Prefer schedule + manual for retraining
   schedule:
     - cron: '0 13 * * 0'  # Every Sunday 8am EST → 13:00 UTC
+  workflow_dispatch:
+
+  # OPTIONAL: only retrain on pushes that affect training pipeline
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "requirements.txt"
+      - ".github/workflows/retrain.yml"
+      - "models/**"
+
+env:
+  POSTGRES_USER: demo
+  POSTGRES_PASSWORD: password
+  POSTGRES_DB: demo
+  POSTGRES_HOST: localhost
+  POSTGRES_PORT: "5432"
+  WORKFLOW_TABLE: user_events
+  AWS_REGION: us-east-1
+  S3_MODEL_URI: s3://thurmans-demo-models/mlops/models/model.pkl
 
 jobs:
   seed-and-train:
     runs-on: ubuntu-latest
+
     services:
       postgres:
         image: postgres:15
         env:
-          POSTGRES_USER: demo
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: demo
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
         ports:
           - 5432:5432
         options: >-
@@ -37,7 +55,7 @@ jobs:
       - name: Set up Python 3.13
         uses: actions/setup-python@v4
         with:
-          python-version: 3.13
+          python-version: "3.13"
 
       - name: Install dependencies
         run: |
@@ -48,7 +66,7 @@ jobs:
 
       - name: Wait for Postgres
         run: |
-          until pg_isready -h localhost -p 5432 -U demo; do
+          until pg_isready -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" -U "${POSTGRES_USER}"; do
             echo "Waiting for Postgres..."
             sleep 2
           done
@@ -58,27 +76,15 @@ jobs:
           source venv/bin/activate
           python scripts/seed_data.py
         env:
-          POSTGRES_USER: demo
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: demo
-          POSTGRES_HOST: localhost
-          POSTGRES_PORT: 5432
           PYTHONPATH: ${{ github.workspace }}
-          WORKFLOW_TABLE: user_events
 
       - name: Train / Retrain model
         run: |
           source venv/bin/activate
           python scripts/train.py
         env:
-          POSTGRES_USER: demo
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: demo
-          POSTGRES_HOST: localhost
-          POSTGRES_PORT: 5432
           PYTHONPATH: ${{ github.workspace }}
-          WORKFLOW_TABLE: user_events
-          
+
       - name: Upload trained model artifact
         uses: actions/upload-artifact@v4
         with:
@@ -88,26 +94,30 @@ jobs:
           compression-level: 6
           overwrite: false
 
+      # Only publish from main branch
       - name: Configure AWS credentials (OIDC)
+        if: ${{ github.ref == 'refs/heads/main' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::080967118593:role/thurmans-mlops-demo-role
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Validate AWS identity
+        if: ${{ github.ref == 'refs/heads/main' }}
         run: aws sts get-caller-identity
 
       - name: Upload model.pkl to S3
+        if: ${{ github.ref == 'refs/heads/main' }}
         run: |
-          source venv/bin/activate
-          echo "Models found:" && find models -maxdepth 4 -type f -name "model.pkl" -print
-
+          echo "Models found:" && find models -maxdepth 6 -type f -name "model.pkl" -print
           python - <<'PY'
           import os, glob, subprocess
+          s3_uri = os.environ["S3_MODEL_URI"]
           candidates = glob.glob("models/**/model.pkl", recursive=True)
           assert candidates, "No model.pkl found under models/**/model.pkl"
           model_path = max(candidates, key=lambda p: os.path.getsize(p))
-          print(f"Uploading: {model_path} ({os.path.getsize(model_path)} bytes)")
-          subprocess.check_call(["aws","s3","cp", model_path, "s3://thurmans-demo-models/mlops/models/model.pkl"])
-          subprocess.check_call(["aws","s3","ls", "s3://thurmans-demo-models/mlops/models/"])
+          size = os.path.getsize(model_path)
+          print(f"Uploading: {model_path} ({size} bytes) -> {s3_uri}")
+          subprocess.check_call(["aws","s3","cp", model_path, s3_uri])
+          subprocess.check_call(["aws","s3","ls", os.path.dirname(s3_uri) + "/"])
           PY
