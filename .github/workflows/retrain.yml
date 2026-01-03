@@ -5,19 +5,9 @@ permissions:
   contents: read
 
 on:
-  # Prefer schedule + manual for retraining
-  schedule:
-    - cron: '0 13 * * 0'  # Every Sunday 8am EST → 13:00 UTC
   workflow_dispatch:
-
-  # OPTIONAL: only retrain on pushes that affect training pipeline
-  push:
-    branches: [main]
-    paths:
-      - "scripts/**"
-      - "requirements.txt"
-      - ".github/workflows/retrain.yml"
-      - "models/**"
+  schedule:
+    - cron: "0 13 * * 0"  # Every Sunday 8am EST → 13:00 UTC
 
 env:
   POSTGRES_USER: demo
@@ -85,39 +75,26 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
 
-      - name: Upload trained model artifact
+      - name: Upload trained model artifact (GitHub)
         uses: actions/upload-artifact@v4
         with:
           name: mlops-model
-          path: models/**/model.pkl
-          if-no-files-found: warn
+          path: models/model.pkl
+          if-no-files-found: error
           compression-level: 6
           overwrite: false
 
-      # Only publish from main branch
       - name: Configure AWS credentials (OIDC)
-        if: ${{ github.ref == 'refs/heads/main' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::080967118593:role/thurmans-mlops-demo-role
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Validate AWS identity
-        if: ${{ github.ref == 'refs/heads/main' }}
         run: aws sts get-caller-identity
 
       - name: Upload model.pkl to S3
-        if: ${{ github.ref == 'refs/heads/main' }}
         run: |
-          echo "Models found:" && find models -maxdepth 6 -type f -name "model.pkl" -print
-          python - <<'PY'
-          import os, glob, subprocess
-          s3_uri = os.environ["S3_MODEL_URI"]
-          candidates = glob.glob("models/**/model.pkl", recursive=True)
-          assert candidates, "No model.pkl found under models/**/model.pkl"
-          model_path = max(candidates, key=lambda p: os.path.getsize(p))
-          size = os.path.getsize(model_path)
-          print(f"Uploading: {model_path} ({size} bytes) -> {s3_uri}")
-          subprocess.check_call(["aws","s3","cp", model_path, s3_uri])
-          subprocess.check_call(["aws","s3","ls", os.path.dirname(s3_uri) + "/"])
-          PY
+          test -f models/model.pkl
+          aws s3 cp models/model.pkl "${S3_MODEL_URI}"
+          aws s3 ls "$(dirname "${S3_MODEL_URI}")/"
