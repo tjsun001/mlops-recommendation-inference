@@ -158,4 +158,24 @@ def ready(request: Request):
     if not meta or not meta.get("model_sha256") or not meta.get("model_size_bytes"):
         return {"status": "not_ready", "reason": "model_metadata_missing"}
 
-    return {"status": "
+    return {"status": "ready"}
+
+@app.get("/api/inference/health")
+def health_alias(request: Request):
+    return health(request)
+
+@app.get("/api/inference/ready")
+def ready_alias(request: Request):
+    return ready(request)
+
+@app.post("/recommendations")
+def recommendations(req: PredictRequest, request: Request):
+    with model_lock:
+        model = request.app.state.model
+
+    # Support a couple common shapes
+    rec_map = model.get("recommendations") or {}
+    recs = rec_map.get(req.user_id) or model.get("popular") or [1, 2, 3, 101, 102]
+
+    return {"user_id": req.user_id, "recommendations": recs, "source": "ml"}
+

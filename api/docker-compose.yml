@@ -1,0 +1,14 @@
+services:
+  inference:
+    container_name: inference
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      MODEL_PATH: /tmp/model.pkl
+      AWS_REGION: us-east-1
+    volumes:
+      - ../models/model.pkl:/tmp/model.pkl:ro
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

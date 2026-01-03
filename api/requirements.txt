@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic
+boto3
+joblib
+# plus numpy / pandas / scikit-learn if your model requires them

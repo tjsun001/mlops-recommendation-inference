@@ -1,0 +1,53 @@
+services:
+  db:
+    container_name: mlops-postgres
+    image: postgres:15
+    environment:
+      POSTGRES_DB: jfs
+      POSTGRES_USER: amigoscode
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5333:5432"
+    networks: [amigos]
+
+  inference:
+    container_name: inference
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      MODEL_PATH: /tmp/model.pkl
+      AWS_REGION: us-east-1
+    volumes:
+      - ./models/model.pkl:/tmp/model.pkl:ro
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/ready"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    networks: [amigos]
+
+  product-service:
+    container_name: product
+    image: cicd-with-github-actions-product-service:latest
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/jfs
+      SPRING_DATASOURCE_USERNAME: amigoscode
+      SPRING_DATASOURCE_PASSWORD: password
+      INFERENCE_BASE_URL: http://inference:8000
+    ports:
+      - "5050:5050"
+    depends_on:
+      db:
+        condition: service_started
+      inference:
+        condition: service_healthy
+    networks: [amigos]
+
+networks:
+  amigos:
+    driver: bridge
