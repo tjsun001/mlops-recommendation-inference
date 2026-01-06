@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pickle
 import threading
@@ -53,6 +54,8 @@ def build_model_meta(
     model: Dict[str, Any],
     model_path: Path,
     loaded_ms: int,
+    *,
+    pointer: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Compute metadata ONCE at load time (or reload time), not per-request.
@@ -61,7 +64,7 @@ def build_model_meta(
     size = file_size_bytes(model_path)
     mtime_utc = file_mtime_utc_iso(model_path)
 
-    return {
+    meta: Dict[str, Any] = {
         "status": "ok",
         "model_type": model.get("type", "unknown"),
         "model_path": str(model_path),
@@ -80,11 +83,30 @@ def build_model_meta(
         "load_ms": loaded_ms,
     }
 
+    # Include pointer info if present (Path A)
+    if pointer:
+        meta["model_pointer_uri"] = pointer.get("pointer_uri")
+        meta["s3_bucket"] = pointer.get("bucket")
+        meta["s3_key"] = pointer.get("key")
+        meta["s3_version_id"] = pointer.get("version_id")
+        meta["semantic_version"] = pointer.get("semantic_version")
+
+    return meta
+
 
 # ---------------------------
-# Optional S3 download support
+# S3 helpers (supports VersionId + pointer file)
 # ---------------------------
-def download_from_s3(s3_uri: str, local_path: Path) -> Path:
+def _s3_client():
+    # boto3 uses instance profile automatically if present
+    region = os.getenv("AWS_REGION", "us-east-1")
+    return boto3.client("s3", region_name=region)
+
+
+def download_from_s3(s3_uri: str, local_path: Path, *, version_id: Optional[str] = None) -> Path:
+    """
+    Download an S3 object to a local path. Supports VersionId if provided.
+    """
     u = urlparse(s3_uri)
     if u.scheme != "s3" or not u.netloc or not u.path:
         raise ValueError(f"Invalid S3 URI: {s3_uri}")
@@ -94,15 +116,41 @@ def download_from_s3(s3_uri: str, local_path: Path) -> Path:
 
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
-    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-1"))
-    s3.download_file(bucket, key, str(local_path))
+    s3 = _s3_client()
+    extra = {}
+    if version_id:
+        extra["VersionId"] = version_id
+
+    # download_file doesn't accept VersionId directly; use get_object when VersionId is needed
+    if version_id:
+        obj = s3.get_object(Bucket=bucket, Key=key, **extra)
+        body = obj["Body"].read()
+        local_path.write_bytes(body)
+    else:
+        s3.download_file(bucket, key, str(local_path))
+
     return local_path
 
 
 def resolve_model_path() -> Path:
+    """
+    Legacy mode (optional):
+      - MODEL_PATH points to local file
+      - optionally download direct object from MODEL_S3_URI (no pointer)
+    Path A mode:
+      - if MODEL_POINTER_S3_URI is set, we fetch production.json and then fetch model by VersionId.
+    """
     env_model_path = os.getenv("MODEL_PATH")
     model_path = Path(env_model_path) if env_model_path else DEFAULT_MODEL_PATH
 
+    # Path A: pointer-based deployment
+    pointer_uri = os.getenv("MODEL_POINTER_S3_URI")
+    if pointer_uri:
+        pointer = ensure_model_present_from_pointer(pointer_uri, model_path)
+        # We keep using model_path; ensure_model_present_from_pointer downloads into it.
+        return model_path
+
+    # Legacy direct download mode (non-versioned)
     s3_uri = os.getenv("MODEL_S3_URI")
     if s3_uri:
         local_override = os.getenv("MODEL_LOCAL_PATH")
@@ -113,6 +161,46 @@ def resolve_model_path() -> Path:
     return model_path
 
 
+def ensure_model_present_from_pointer(pointer_s3_uri: str, model_path: Path) -> Dict[str, Any]:
+    """
+    Downloads production.json, then downloads model.pkl BY VersionId to model_path.
+    Returns pointer metadata for /health and /model/info.
+    """
+    tmp_pointer_path = Path("/tmp/production.json")
+    download_from_s3(pointer_s3_uri, tmp_pointer_path)
+
+    pointer = json.loads(tmp_pointer_path.read_text())
+    art = pointer["model"]["artifact"]
+
+    bucket = art["bucket"]
+    key = art["key"]
+    version_id = (art.get("version_id") or "").strip()
+    if not version_id:
+        raise RuntimeError("production.json missing model.artifact.version_id")
+
+    # Download model by VersionId
+    model_uri = f"s3://{bucket}/{key}"
+    download_from_s3(model_uri, model_path, version_id=version_id)
+
+    # Optional integrity check if sha256 is provided
+    expected_sha = (art.get("sha256") or "").strip()
+    if expected_sha:
+        actual_sha = file_sha256(model_path)
+        if actual_sha and actual_sha != expected_sha:
+            raise RuntimeError(f"SHA mismatch: expected={expected_sha}, actual={actual_sha}")
+
+    return {
+        "pointer_uri": pointer_s3_uri,
+        "bucket": bucket,
+        "key": key,
+        "version_id": version_id,
+        "semantic_version": pointer.get("release", {}).get("semantic_version", ""),
+    }
+
+
+# ---------------------------
+# Model loading
+# ---------------------------
 def load_model_from_disk(model_path: Path) -> Dict[str, Any]:
     if not model_path.exists() or model_path.stat().st_size == 0:
         raise RuntimeError(f"Missing/empty model file: {model_path}")
@@ -132,10 +220,35 @@ def load_model_bundle() -> tuple[Dict[str, Any], Path, Dict[str, Any]]:
     Returns: (model, model_path, model_meta)
     """
     t0 = time.perf_counter()
+
+    pointer_meta: Optional[Dict[str, Any]] = None
+    pointer_uri = os.getenv("MODEL_POINTER_S3_URI")
     model_path = resolve_model_path()
+
+    # If Path A is enabled, ensure_model_present_from_pointer already ran inside resolve_model_path
+    # but we want pointer metadata in health/info, so re-read pointer quickly (cheap) OR compute once here.
+    if pointer_uri:
+        # Only fetch if model file isn't present (avoid extra work on warm restarts)
+        if (not model_path.exists()) or (model_path.stat().st_size == 0):
+            pointer_meta = ensure_model_present_from_pointer(pointer_uri, model_path)
+        else:
+            # Still load pointer for metadata (tiny file)
+            tmp_pointer_path = Path("/tmp/production.json")
+            download_from_s3(pointer_uri, tmp_pointer_path)
+            p = json.loads(tmp_pointer_path.read_text())
+            art = p["model"]["artifact"]
+            pointer_meta = {
+                "pointer_uri": pointer_uri,
+                "bucket": art.get("bucket"),
+                "key": art.get("key"),
+                "version_id": art.get("version_id"),
+                "semantic_version": p.get("release", {}).get("semantic_version", ""),
+            }
+
     model = load_model_from_disk(model_path)
+
     loaded_ms = int((time.perf_counter() - t0) * 1000)
-    meta = build_model_meta(model, model_path, loaded_ms)
+    meta = build_model_meta(model, model_path, loaded_ms, pointer=pointer_meta)
     return model, model_path, meta
 
 
@@ -199,6 +312,37 @@ def ready_alias(request: Request):
 
 
 # ---------------------------
+# Model control endpoints (Path A)
+# ---------------------------
+@app.get("/model/info")
+def model_info(request: Request):
+    with model_lock:
+        meta = getattr(request.app.state, "model_meta", None)
+    return meta or {"status": "not_ready"}
+
+
+@app.post("/model/reload")
+def model_reload(request: Request):
+    """
+    Pull latest production pointer + versioned model from S3 and reload in-memory model.
+    Keep this internal-only (not public).
+    """
+    try:
+        t0 = time.perf_counter()
+        model, model_path, meta = load_model_bundle()
+        meta["reload_ms"] = int((time.perf_counter() - t0) * 1000)
+
+        with model_lock:
+            request.app.state.model = model
+            request.app.state.model_path = model_path
+            request.app.state.model_meta = meta
+
+        return {"status": "reloaded", "model_meta": meta}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ---------------------------
 # Inference
 # ---------------------------
 @app.post("/recommendations")
@@ -206,7 +350,6 @@ def recommendations(req: PredictRequest, request: Request):
     with model_lock:
         model = request.app.state.model
 
-    # Support a couple common shapes
     rec_map = model.get("recommendations") or {}
     recs = rec_map.get(req.user_id) or model.get("popular") or [1, 2, 3, 101, 102]
 
