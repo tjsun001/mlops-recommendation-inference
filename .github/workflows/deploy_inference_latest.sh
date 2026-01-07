@@ -6,26 +6,26 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Deploy to EC2 via SSH (pull latest + restart + ready check)
+      - name: Deploy to EC2 (pull latest + restart + ready check)
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.EC2_HOST }}          # Elastic IP or DNS
-          username: ${{ secrets.EC2_USER }}      # usually ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}        # private key
+          host: ${{ secrets.EC2_HOST }}          # Elastic IP
+          username: ${{ secrets.EC2_USER }}      # e.g., ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}        # private key (PEM content)
           script: |
             set -euo pipefail
 
+            # TODO: set this to the folder that has docker-compose.yml
             cd ~/my-mlops-demo
 
             echo "== Pull latest =="
             docker compose pull inference-service
 
-            echo "== Restart service =="
+            echo "== Restart inference-service =="
             docker compose up -d --no-deps inference-service
 
-            echo "== Show running containers =="
+            echo "== Status =="
             docker compose ps
 
             echo "== Wait for /ready (timeout 180s) =="
