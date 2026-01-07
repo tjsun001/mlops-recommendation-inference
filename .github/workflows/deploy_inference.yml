@@ -1,5 +1,7 @@
 name: Deploy Inference Model (EC2)
 
+# Manual deploy only: run via Actions -> Deploy Inference Model (EC2) -> Run workflow
+
 permissions:
   contents: read
 
@@ -42,3 +44,23 @@ jobs:
             docker compose pull inference
             docker compose up -d --no-deps --force-recreate inference
             docker compose ps inference
+
+            echo "[deploy-model] Waiting for inference to become ready..."
+            for i in {1..20}; do
+              if curl -fsS "http://127.0.0.1:8000/ready" >/dev/null; then
+                echo "[deploy-model] Inference is ready ✅"
+                break
+              fi
+              echo "[deploy-model] Not ready yet... ($i/20)"
+              sleep 2
+            done
+
+            echo "[deploy-model] /ready:"
+            curl -fsS "http://127.0.0.1:8000/ready" | cat
+            echo
+
+            echo "[deploy-model] /model/info:"
+            curl -fsS "http://127.0.0.1:8000/model/info" | cat
+            echo
+
+            echo "[deploy-model] Done ✅"
