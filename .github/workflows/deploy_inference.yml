@@ -6,9 +6,20 @@ permissions:
   contents: read
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "30 13 * * 0"  # Sundays 8:30am ET (13:30 UTC)
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "requirements.txt"
+      - "api/**"
+      - ".github/workflows/build.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "requirements.txt"
+      - "api/**"
+      - ".github/workflows/build.yml"
+
 
 jobs:
   deploy-inference-model:
