@@ -19,6 +19,10 @@ from pydantic import BaseModel
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL_PATH = ROOT / "models" / "model.pkl"
 
+# Pointer defaults (Path A)
+DEFAULT_POINTER_S3_URI = "s3://thurmans-demo-models/mlops/models/recommender/production.json"
+DEFAULT_POINTER_LOCAL_PATH = Path("/tmp/production.json")
+
 model_lock = threading.Lock()
 
 # ---------------------------
@@ -68,28 +72,26 @@ def build_model_meta(
         "status": "ok",
         "model_type": model.get("type", "unknown"),
         "model_path": str(model_path),
-
-        # File identity (this is what you compare to S3)
+        # File identity
         "model_sha256": sha,
         "model_sha256_short": sha[:8] if sha else None,
-
         # File facts
         "model_size_bytes": size,
-        "model_bytes": size,  # alias for convenience
+        "model_bytes": size,  # alias
         "model_mtime_utc": mtime_utc,
-
         # Load timing
         "loaded_at_unix": int(time.time()),
         "load_ms": loaded_ms,
     }
 
-    # Include pointer info if present (Path A)
     if pointer:
         meta["model_pointer_uri"] = pointer.get("pointer_uri")
+        meta["model_pointer_local_path"] = pointer.get("pointer_local_path")
         meta["s3_bucket"] = pointer.get("bucket")
         meta["s3_key"] = pointer.get("key")
         meta["s3_version_id"] = pointer.get("version_id")
         meta["semantic_version"] = pointer.get("semantic_version")
+        meta["promoted_at"] = pointer.get("promoted_at")
 
     return meta
 
@@ -103,73 +105,46 @@ def _s3_client():
     return boto3.client("s3", region_name=region)
 
 
-def download_from_s3(s3_uri: str, local_path: Path, *, version_id: Optional[str] = None) -> Path:
-    """
-    Download an S3 object to a local path. Supports VersionId if provided.
-    """
+def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     u = urlparse(s3_uri)
     if u.scheme != "s3" or not u.netloc or not u.path:
         raise ValueError(f"Invalid S3 URI: {s3_uri}")
+    return u.netloc, u.path.lstrip("/")
 
-    bucket = u.netloc
-    key = u.path.lstrip("/")
+
+def download_from_s3(
+    s3_uri: str,
+    local_path: Path,
+    *,
+    version_id: Optional[str] = None,
+) -> Path:
+    """
+    Download an S3 object to a local path. Supports VersionId if provided.
+    """
+    bucket, key = _parse_s3_uri(s3_uri)
 
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
     s3 = _s3_client()
-    extra = {}
     if version_id:
-        extra["VersionId"] = version_id
-
-    # download_file doesn't accept VersionId directly; use get_object when VersionId is needed
-    if version_id:
-        obj = s3.get_object(Bucket=bucket, Key=key, **extra)
-        body = obj["Body"].read()
-        local_path.write_bytes(body)
+        # download_file doesn't support VersionId; use get_object
+        obj = s3.get_object(Bucket=bucket, Key=key, VersionId=version_id)
+        local_path.write_bytes(obj["Body"].read())
     else:
         s3.download_file(bucket, key, str(local_path))
 
     return local_path
 
 
-def resolve_model_path() -> Path:
-    """
-    Legacy mode (optional):
-      - MODEL_PATH points to local file
-      - optionally download direct object from MODEL_S3_URI (no pointer)
-    Path A mode:
-      - if MODEL_POINTER_S3_URI is set, we fetch production.json and then fetch model by VersionId.
-    """
-    env_model_path = os.getenv("MODEL_PATH")
-    model_path = Path(env_model_path) if env_model_path else DEFAULT_MODEL_PATH
-
-    # Path A: pointer-based deployment
-    pointer_uri = os.getenv("MODEL_POINTER_S3_URI")
-    if pointer_uri:
-        pointer = ensure_model_present_from_pointer(pointer_uri, model_path)
-        # We keep using model_path; ensure_model_present_from_pointer downloads into it.
-        return model_path
-
-    # Legacy direct download mode (non-versioned)
-    s3_uri = os.getenv("MODEL_S3_URI")
-    if s3_uri:
-        local_override = os.getenv("MODEL_LOCAL_PATH")
-        download_target = Path(local_override) if local_override else model_path
-        download_from_s3(s3_uri, download_target)
-        model_path = download_target
-
-    return model_path
-
-
 def ensure_model_present_from_pointer(pointer_s3_uri: str, model_path: Path) -> Dict[str, Any]:
     """
-    Downloads production.json, then downloads model.pkl BY VersionId to model_path.
+    Path A: Download production.json, then download model.pkl BY VersionId to model_path.
     Returns pointer metadata for /health and /model/info.
     """
-    tmp_pointer_path = Path("/tmp/production.json")
-    download_from_s3(pointer_s3_uri, tmp_pointer_path)
+    pointer_local_path = Path(os.getenv("MODEL_POINTER_LOCAL_PATH", str(DEFAULT_POINTER_LOCAL_PATH)))
+    download_from_s3(pointer_s3_uri, pointer_local_path)
 
-    pointer = json.loads(tmp_pointer_path.read_text())
+    pointer = json.loads(pointer_local_path.read_text())
     art = pointer["model"]["artifact"]
 
     bucket = art["bucket"]
@@ -178,7 +153,7 @@ def ensure_model_present_from_pointer(pointer_s3_uri: str, model_path: Path) -> 
     if not version_id:
         raise RuntimeError("production.json missing model.artifact.version_id")
 
-    # Download model by VersionId
+    # Download model by VersionId to the path FastAPI will load from
     model_uri = f"s3://{bucket}/{key}"
     download_from_s3(model_uri, model_path, version_id=version_id)
 
@@ -189,13 +164,37 @@ def ensure_model_present_from_pointer(pointer_s3_uri: str, model_path: Path) -> 
         if actual_sha and actual_sha != expected_sha:
             raise RuntimeError(f"SHA mismatch: expected={expected_sha}, actual={actual_sha}")
 
+    # Sanity check
+    if (not model_path.exists()) or model_path.stat().st_size == 0:
+        raise RuntimeError(f"Downloaded model is missing/empty: {model_path}")
+
     return {
         "pointer_uri": pointer_s3_uri,
+        "pointer_local_path": str(pointer_local_path),
         "bucket": bucket,
         "key": key,
         "version_id": version_id,
         "semantic_version": pointer.get("release", {}).get("semantic_version", ""),
+        "promoted_at": pointer.get("release", {}).get("promoted_at"),
     }
+
+
+def resolve_model_path() -> Path:
+    """
+    Resolve the local path we should load the model from.
+
+    Path A (preferred):
+      - MODEL_POINTER_S3_URI is set
+      - We fetch production.json and then fetch model by VersionId into MODEL_PATH (default /tmp/model.pkl in container)
+
+    Legacy direct download mode (optional):
+      - MODEL_S3_URI points directly to an object (non-versioned)
+    """
+    env_model_path = os.getenv("MODEL_PATH")
+    model_path = Path(env_model_path) if env_model_path else DEFAULT_MODEL_PATH
+
+    # In Path A, we still load from model_path, but we ensure it's downloaded first in load_model_bundle().
+    return model_path
 
 
 # ---------------------------
@@ -218,36 +217,34 @@ def load_model_bundle() -> tuple[Dict[str, Any], Path, Dict[str, Any]]:
     """
     Loads model + computes metadata once.
     Returns: (model, model_path, model_meta)
+
+    Behavior:
+      - If MODEL_POINTER_S3_URI is set (Path A), download production.json and versioned model.pkl into model_path first.
+      - Else if MODEL_S3_URI is set (legacy direct object), download it to model_path first.
+      - Else load from local disk path.
     """
     t0 = time.perf_counter()
 
-    pointer_meta: Optional[Dict[str, Any]] = None
-    pointer_uri = os.getenv("MODEL_POINTER_S3_URI")
     model_path = resolve_model_path()
 
-    # If Path A is enabled, ensure_model_present_from_pointer already ran inside resolve_model_path
-    # but we want pointer metadata in health/info, so re-read pointer quickly (cheap) OR compute once here.
+    pointer_meta: Optional[Dict[str, Any]] = None
+    pointer_uri = os.getenv("MODEL_POINTER_S3_URI")
+
     if pointer_uri:
-        # Only fetch if model file isn't present (avoid extra work on warm restarts)
-        if (not model_path.exists()) or (model_path.stat().st_size == 0):
-            pointer_meta = ensure_model_present_from_pointer(pointer_uri, model_path)
-        else:
-            # Still load pointer for metadata (tiny file)
-            tmp_pointer_path = Path("/tmp/production.json")
-            download_from_s3(pointer_uri, tmp_pointer_path)
-            p = json.loads(tmp_pointer_path.read_text())
-            art = p["model"]["artifact"]
-            pointer_meta = {
-                "pointer_uri": pointer_uri,
-                "bucket": art.get("bucket"),
-                "key": art.get("key"),
-                "version_id": art.get("version_id"),
-                "semantic_version": p.get("release", {}).get("semantic_version", ""),
-            }
+        # Always ensure the correct version is present at startup/reload.
+        pointer_meta = ensure_model_present_from_pointer(pointer_uri, model_path)
+    else:
+        # Legacy direct S3 URI mode (optional)
+        s3_uri = os.getenv("MODEL_S3_URI")
+        if s3_uri:
+            local_override = os.getenv("MODEL_LOCAL_PATH")
+            download_target = Path(local_override) if local_override else model_path
+            download_from_s3(s3_uri, download_target)
+            model_path = download_target
 
     model = load_model_from_disk(model_path)
-
     loaded_ms = int((time.perf_counter() - t0) * 1000)
+
     meta = build_model_meta(model, model_path, loaded_ms, pointer=pointer_meta)
     return model, model_path, meta
 
@@ -280,7 +277,6 @@ def health(request: Request):
     """
     with model_lock:
         meta = getattr(request.app.state, "model_meta", None)
-
     return meta or {"status": "ok", "service": "inference"}
 
 
@@ -327,19 +323,17 @@ def model_reload(request: Request):
     Pull latest production pointer + versioned model from S3 and reload in-memory model.
     Keep this internal-only (not public).
     """
-    try:
-        t0 = time.perf_counter()
-        model, model_path, meta = load_model_bundle()
-        meta["reload_ms"] = int((time.perf_counter() - t0) * 1000)
+    t0 = time.perf_counter()
+    model, model_path, meta = load_model_bundle()
+    meta["reload_ms"] = int((time.perf_counter() - t0) * 1000)
 
-        with model_lock:
-            request.app.state.model = model
-            request.app.state.model_path = model_path
-            request.app.state.model_meta = meta
+    with model_lock:
+        request.app.state.model = model
+        request.app.state.model_path = model_path
+        request.app.state.model_meta = meta
 
-        return {"status": "reloaded", "model_meta": meta}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    # Keep response small and useful
+    return {"status": "reloaded", "reload_ms": meta["reload_ms"], "model_path": str(model_path)}
 
 
 # ---------------------------
