@@ -1,4 +1,5 @@
-name: MLops CI
+name: CI (seed-data only)
+
 
 on:
   push:
